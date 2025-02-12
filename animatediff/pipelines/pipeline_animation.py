@@ -373,6 +373,17 @@ class AnimationPipeline(DiffusionPipeline):
         # Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
+        timesteps = make_ddim_timesteps('quad2', num_ddim_timesteps=num_inference_steps, num_ddpm_timesteps=1000)
+        timesteps = torch.tensor(timesteps, device=device)
+        # timesteps = torch.tensor([
+        #         998, 958, 919, 880, 842, 805, 769, 733, 699, 665, 
+        #         632, 600, 569, 539, 509, 480, 453, 426, 399, 374, 
+        #         349, 326, 303, 281, 260, 239, 220, 201, 183, 166, 
+        #         150, 134, 120, 106, 93, 81, 70, 59, 50, 41, 
+        #         33, 26, 20, 14, 10, 6, 3, 2, 1, 0  # 删除最后一个0避免重复
+        #     ], device="cuda:0")
+        self.scheduler.timesteps = timesteps
+
 
         # Prepare latent variables
         num_channels_latents = self.unet.in_channels
@@ -398,10 +409,10 @@ class AnimationPipeline(DiffusionPipeline):
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t) # meaningless, just return the input
 
                 down_block_additional_residuals = mid_block_additional_residual = None
-                if (getattr(self, "controlnet", None) != None) and (controlnet_images != None):
+                if (getattr(self, "controlnet", None) != None) and (controlnet_images != None): # won't use
                     assert controlnet_images.dim() == 5
 
                     controlnet_noisy_latents = latent_model_input
@@ -463,3 +474,29 @@ class AnimationPipeline(DiffusionPipeline):
             return video
 
         return AnimationPipelineOutput(videos=video)
+
+def make_ddim_timesteps(ddim_discr_method, num_ddim_timesteps, num_ddpm_timesteps):
+    if ddim_discr_method == 'uniform':
+        c = num_ddpm_timesteps // num_ddim_timesteps
+        ddim_timesteps = np.asarray(list(range(0, num_ddpm_timesteps, c)))
+    elif ddim_discr_method == 'quad':
+        ddim_timesteps = ((np.linspace(0, np.sqrt(num_ddpm_timesteps * .8), num_ddim_timesteps)) ** 2).astype(int)
+    elif ddim_discr_method == 'quad2':
+        ddim_timesteps = ((np.linspace(0, np.sqrt(num_ddpm_timesteps * .999), num_ddim_timesteps)) ** 2).astype(int)
+    elif ddim_discr_method == 'log':
+        # 生成对数空间时间步
+        ddim_timesteps = (np.logspace(0, np.log10(num_ddpm_timesteps), num_ddim_timesteps) - 1).astype(int)
+        ddim_timesteps[-1] = num_ddpm_timesteps - 2
+    elif ddim_discr_method == 'exp':
+        ddim_timesteps = (np.exp(np.linspace(0, np.log(num_ddpm_timesteps), num_ddim_timesteps)) - 1).astype(int)
+        
+    
+    else:
+        raise NotImplementedError(f'There is no ddim discretization method called "{ddim_discr_method}"')
+    print(f'Selected timesteps for ddim sampler: {ddim_timesteps}')
+    # assert ddim_timesteps.shape[0] == num_ddim_timesteps
+    # add one to get the final alpha values right (the ones from first scale to data during sampling)
+    steps_out = ddim_timesteps + 1
+    # if verbose:
+    #     print(f'Selected timesteps for ddim sampler: {steps_out}')
+    return steps_out[::-1].copy()

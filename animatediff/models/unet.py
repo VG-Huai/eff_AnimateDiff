@@ -25,7 +25,9 @@ from .unet_blocks import (
     get_up_block,
 )
 from .resnet import InflatedConv3d, InflatedGroupNorm
-
+from einops import rearrange
+from xformers.ops.fmha.attn_bias import BlockDiagonalMask
+import torch.nn.functional as F
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -349,7 +351,60 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         # However, the upsampling interpolation output size can be forced to fit any upsampling size
         # on the fly if necessary.
         default_overall_up_factor = 2**self.num_upsamplers
-
+        input_batch_size, c, frame, h, w = sample.shape
+        
+        # filter toekn percentage
+        if timestep <= 500:
+            keep_idxs = self.batched_find_idxs_to_keep(sample, threshold=0.4, tubelet_size=1, patch_size=1)
+        else:
+            keep_idxs = self.batched_find_idxs_to_keep(sample, threshold=0.3, tubelet_size=1, patch_size=1)
+        # keep_idxs = self.batched_find_idxs_to_keep(sample, threshold=0.5, tubelet_size=1, patch_size=1)
+        print('------------------')
+        total_tokens = keep_idxs.numel()
+        filtered_tokens = (keep_idxs == 0).sum().item()
+        filtered_percentage = 100.0 * filtered_tokens / total_tokens
+        print('timestep:', timestep)
+        print(f"Mask Filtering: {filtered_percentage:.2f}% tokens filtered")    
+        
+        # get all the mask and attn_bias
+        mask_dict = {}
+        attn_bias_dict = {}
+        
+        cur_h, cur_w = sample.shape[-2:]
+        org_h, org_w = cur_h, cur_w
+        mask = keep_idxs
+        for i in range(4):
+            mask_dict[(cur_h, cur_w)] = {}
+            mask_dict[(cur_h, cur_w)]['mask'] = mask
+            mask_dict[(cur_h, cur_w)]['spatial'] = {}
+            mask_dict[(cur_h, cur_w)]['temporal'] = {}
+            mask_dict = self.compute_mask_dict_spatial(mask_dict, cur_h, cur_w)
+            mask_dict = self.compute_mask_dict_temporal(mask_dict, cur_h, cur_w)
+            # spatial mode
+            seq_len_q_spatial = cur_h * cur_w # h * w
+            seq_len_q_temporal = sample.shape[2] # t
+            if encoder_hidden_states is not None:
+                seq_len_kv_spatial = encoder_hidden_states.shape[1]
+                seq_len_kv_temporal = encoder_hidden_states.shape[1]
+            else:
+                seq_len_kv_spatial = seq_len_q_spatial
+                seq_len_kv_temporal = seq_len_q_temporal
+            attn_bias_dict[(cur_h, cur_w)] = {}
+            attn_bias_dict[(cur_h, cur_w)]['spatial'] = {}
+            attn_bias_dict[(cur_h, cur_w)]['temporal'] = {}
+            attn_bias_dict[(cur_h, cur_w)]['spatial']['self'], _, _ = self.create_block_diagonal_attention_mask(mask, seq_len_q_spatial, mode='spatial')
+            attn_bias_dict[(cur_h, cur_w)]['temporal']['self'], _, _ = self.create_block_diagonal_attention_mask(mask, seq_len_q_temporal, mode='temporal')
+            attn_bias_dict[(cur_h, cur_w)]['spatial']['cross'], _, _ = self.create_block_diagonal_attention_mask(mask, seq_len_kv_spatial, mode='spatial')
+            attn_bias_dict[(cur_h, cur_w)]['temporal']['cross'], _, _ = self.create_block_diagonal_attention_mask(mask, seq_len_kv_temporal, mode ='temporal')
+            # attn_bias_dict[(cur_h, cur_w)]['spatial']['self'], _, _ = create_fake_block_diagonal_attention_mask(mask, seq_len_q)
+            # attn_bias_dict[(cur_h, cur_w)]['temporal']['self'], _, _ = create_fake_block_diagonal_attention_mask(mask, seq_len_q)
+            # attn_bias_dict[(cur_h, cur_w)]['spatial']['cross'], _, _ = create_fake_block_diagonal_attention_mask(mask, seq_len_kv)
+            # attn_bias_dict[(cur_h, cur_w)]['temporal']['cross'], _, _ = create_fake_block_diagonal_attention_mask(mask, seq_len_kv)
+            cur_h, cur_w = cur_h//2, cur_w//2
+            mask = self.resize_mask(mask, cur_h, cur_w)        
+        
+        
+        
         # upsample size should be forwarded when sample is not a multiple of `default_overall_up_factor`
         forward_upsample_size = False
         upsample_size = None
@@ -413,6 +468,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                     temb=emb,
                     encoder_hidden_states=encoder_hidden_states,
                     attention_mask=attention_mask,
+                    mask_dict = mask_dict,
+                    attn_bias_dict = attn_bias_dict,
                 )
             else:
                 sample, res_samples = downsample_block(hidden_states=sample, temb=emb, encoder_hidden_states=encoder_hidden_states)
@@ -429,7 +486,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
 
         # mid
         sample = self.mid_block(
-            sample, emb, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask
+            sample, emb, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask,
+            mask_dict = mask_dict, attn_bias_dict = attn_bias_dict,
         )
 
         # support controlnet
@@ -458,10 +516,13 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     upsample_size=upsample_size,
                     attention_mask=attention_mask,
+                    mask_dict = mask_dict,
+                    attn_bias_dict = attn_bias_dict,
                 )
             else:
                 sample = upsample_block(
                     hidden_states=sample, temb=emb, res_hidden_states_tuple=res_samples, upsample_size=upsample_size, encoder_hidden_states=encoder_hidden_states,
+                    mask_dict = mask_dict, attn_bias_dict = attn_bias_dict,
                 )
 
         # post-process
@@ -473,7 +534,204 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
             return (sample,)
 
         return UNet3DConditionOutput(sample=sample)
+    def create_block_diagonal_attention_mask(self, mask, kv_seqlen, mode='spatial'):
+        """
+        将 mask 和 kv_seqlen 转换为 BlockDiagonalMask, 用于高效的注意力计算。
+        
+        Args:
+            mask (torch.Tensor): 输入的掩码，标记哪些 token 应该被忽略。
+            kv_seqlen (torch.Tensor): 键/值的序列长度。
+            heads (int): 注意力头的数量。
 
+        Returns:
+            BlockDiagonalPaddedKeysMask: 转换后的注意力掩码，用于高效的计算。
+        """
+        # 计算 q_seqlen: 通过 mask 来提取有效的查询 token 数量
+        mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+        if mode == 'spatial':
+            mask = rearrange(mask, 'b 1 t h w -> (b t) (h w)')
+        else:
+            mask = rearrange(mask, 'b 1 t h w -> (b h w) (t)')
+        
+        q_seqlen = mask.sum(dim=-1)  # 计算每个批次中有效的查询 token 数量
+        q_seqlen = q_seqlen.tolist()
+        
+        kv_seqlen = [kv_seqlen] * len(q_seqlen)  # 重复 kv_seqlen 次
+
+        # 生成 BlockDiagonalPaddedKeysMask
+        attn_bias = BlockDiagonalMask.from_seqlens(
+            q_seqlen,  
+            kv_seqlen=kv_seqlen,  # 键/值的序列长度
+        )
+        
+        return attn_bias, q_seqlen, kv_seqlen    
+    
+    def compute_mask_dict_spatial(self, mask_dict, cur_h, cur_w):
+        mask = mask_dict[(cur_h, cur_w)]['mask']
+        indices = []
+        _mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+        indices1 = torch.nonzero(_mask.reshape(1, -1).squeeze(0))
+        _mask = rearrange(_mask, 'b 1 t h w -> (b t) (h w)')
+        # for i in range(_mask.size(0)):
+        #     index_per_batch = torch.where(_mask[i].bool())[0]
+        #     indices.append(index_per_batch)
+        mask_dict[(cur_h, cur_w)]['spatial']['indices'] = indices
+        mask_dict[(cur_h, cur_w)]['spatial']['indices1'] = indices1
+        mask_bool = _mask.bool()
+        mask_bool = mask_bool.T
+        device = mask.device
+        batch_size, seq_len = mask_bool.shape
+        # print('------------------')
+        # time_stamp = time.time()
+        arange_indices = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1).to(device)
+        # print('time for arange_indices:', time.time()-time_stamp)
+        # time_stamp = time.time()
+        nonzero_indices = torch.nonzero(mask_bool, as_tuple=True)
+        valid_indices = torch.zeros_like(arange_indices)
+        valid_indices[nonzero_indices[0], torch.cumsum(mask_bool.int(), dim=1)[mask_bool] - 1] = arange_indices[mask_bool]
+        cumsum_mask = torch.cumsum(mask_bool.int(), dim=1)
+        # print('time for cumsum_mask:', time.time()-time_stamp)
+        # time_stamp = time.time()
+        nearest_indices = torch.clip(cumsum_mask - 1, min=0)
+        # print('time for nearest_indices:', time.time()-time_stamp)
+        # time_stamp = time.time()
+        actual_indices = valid_indices.gather(1, nearest_indices)
+        mask_dict[(cur_h, cur_w)]['spatial']['actual_indices'] = actual_indices
+        return mask_dict
+        
+    def compute_mask_dict_temporal(self, mask_dict, cur_h, cur_w):
+        mask = mask_dict[(cur_h, cur_w)]['mask']
+        indices = []
+        _mask = torch.round(mask).to(torch.int)
+        _mask = rearrange(_mask, 'b 1 t h w -> (b h w) (t)')
+        indices1 = torch.nonzero(_mask.reshape(1, -1).squeeze(0))
+        mask_dict[(cur_h, cur_w)]['temporal']['indices'] = indices
+        mask_dict[(cur_h, cur_w)]['temporal']['indices1'] = indices1
+        mask_bool = _mask.bool()
+        device = mask.device
+        batch_size, seq_len = mask_bool.shape
+        arange_indices = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1).to(device)
+        nonzero_indices = torch.nonzero(mask_bool, as_tuple=True)
+        valid_indices = torch.zeros_like(arange_indices)
+        valid_indices[nonzero_indices[0], torch.cumsum(mask_bool.int(), dim=1)[mask_bool] - 1] = arange_indices[mask_bool]
+        cumsum_mask = torch.cumsum(mask_bool.int(), dim=1)
+        nearest_indices = torch.clip(cumsum_mask - 1, min=0)
+        actual_indices = valid_indices.gather(1, nearest_indices)
+        mask_dict[(cur_h, cur_w)]['temporal']['actual_indices'] = actual_indices
+        return mask_dict    
+    
+    def batched_find_idxs_to_keep(self, 
+                            x: torch.Tensor, 
+                            threshold: int=2, 
+                            tubelet_size: int=2,
+                            patch_size: int=16) -> torch.Tensor:
+        """
+        Find the static tokens in a video tensor, and return a mask
+        that selects tokens that are not repeated.
+
+        Args:
+        - x (torch.Tensor): A tensor of shape [B, C, T, H, W].
+        - threshold (int): The mean intensity threshold for considering
+                a token as static.
+        - tubelet_size (int): The temporal length of a token.
+        Returns:
+        - mask (torch.Tensor): A bool tensor of shape [B, T, H, W] 
+            that selects tokens that are not repeated.
+
+        """
+        # Ensure input has the format [B, C, T, H, W]
+        assert len(x.shape) == 5, "Input must be a 5D tensor"
+        #ipdb.set_trace()
+        # Convert to float32 if not already
+        x = x.type(torch.float32)
+        
+        # Calculate differences between frames with a step of tubelet_size, ensuring batch dimension is preserved
+        # Compare "front" of first token to "back" of second token
+        diffs = x[:, :, (2*tubelet_size-1)::tubelet_size] - x[:, :, :-tubelet_size:tubelet_size]
+        # Ensure nwe track negative movement.
+        diffs = torch.abs(diffs)
+        
+        # Apply average pooling over spatial dimensions while keeping the batch dimension intact
+        avg_pool_blocks = F.avg_pool3d(diffs, (1, patch_size, patch_size))
+        # Compute the mean along the channel dimension, preserving the batch dimension
+        avg_pool_blocks = torch.mean(avg_pool_blocks, dim=1, keepdim=True)
+        # Create a dummy first frame for each item in the batch
+        first_frame = torch.ones_like(avg_pool_blocks[:, :, 0:1]) * 255
+        # first_frame = torch.zeros_like(avg_pool_blocks[:, :, 0:1])
+        # Concatenate the dummy first frame with the rest of the frames, preserving the batch dimension
+        avg_pool_blocks = torch.cat([first_frame, avg_pool_blocks], dim=2)
+        # Determine indices to keep based on the threshold, ensuring the operation is applied across the batch
+        # Update mask: 0 for high similarity, 1 for low similarity
+        keep_idxs = avg_pool_blocks.squeeze(1) > threshold  
+        keep_idxs = keep_idxs.unsqueeze(1)
+        keep_idxs = keep_idxs.float()
+        # Flatten out everything but the batch dimension
+        # keep_idxs = keep_idxs.flatten(1)
+        #ipdb.set_trace()
+        return keep_idxs
+
+    def compute_similarity_mask(self, latent, threshold=0.95):
+        """
+        Compute frame-wise similarity for latent and generate mask.
+
+        Args:
+        - latent (torch.Tensor): Latent tensor of shape [n, c, t, h, w].
+        - threshold (float): Similarity threshold to determine whether to skip computation.
+
+        Returns:
+        - mask (torch.Tensor): Mask tensor of shape [n, 1, t, h, w],
+        where mask = 0 means skip computation, mask = 1 means recompute.
+        """
+        n, c, t, h, w = latent.shape
+        mask = torch.ones((n, 1, t, h, w), device=latent.device)  # Initialize mask with all 1s
+
+        for frame_idx in range(1, t):  # Start from the second frame
+            curr_frame = latent[:, :, frame_idx, :, :]  # Current frame [n, c, h, w]
+            prev_frame = latent[:, :, frame_idx - 1, :, :]  # Previous frame [n, c, h, w]
+
+            # Compute token-wise cosine similarity
+            dot_product = (curr_frame * prev_frame).sum(dim=1, keepdim=True)  # [n, 1, h, w]
+            norm_curr = curr_frame.norm(dim=1, keepdim=True)
+            norm_prev = prev_frame.norm(dim=1, keepdim=True)
+            similarity = dot_product / (norm_curr * norm_prev + 1e-8)  # Avoid division by zero
+
+            # Update mask: 0 for high similarity, 1 for low similarity
+            mask[:, :, frame_idx, :, :] = (similarity <= threshold).float()
+        # mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+        return mask
+    
+    def resize_mask(self, mask, target_h, target_w):
+        """
+        Resize the mask to match the new spatial dimensions of x.
+
+        Args:
+        - mask (torch.Tensor): Input mask of shape [b, 1, t, h, w].
+        - target_h (int): Target height.
+        - target_w (int): Target width.
+
+        Returns:
+        - resized_mask (torch.Tensor): Resized mask of shape [b, 1, t, target_h, target_w].
+        """
+        if mask is None:
+            return mask
+        batch, _, t, h, w = mask.shape
+
+        if h == target_h and w == target_w:
+            return mask  # No resizing needed
+
+        # Reshape to [b * t, 1, h, w]
+        mask = mask.view(batch * t, 1, h, w)
+
+        # Resize to [b * t, 1, target_h, target_w]
+        resized_mask = F.interpolate(mask, size=(target_h, target_w), mode="bilinear", align_corners=False)
+
+        # Ensure the mask is binary (0 or 1)
+        resized_mask = (resized_mask > 0.5).float()
+
+        # Reshape back to [b, 1, t, target_h, target_w]
+        resized_mask = resized_mask.view(batch, 1, t, target_h, target_w)
+
+        return resized_mask
     @classmethod
     def from_pretrained_2d(cls, pretrained_model_name_or_path, unet_additional_kwargs={}, **kwargs):
         from diffusers import __version__

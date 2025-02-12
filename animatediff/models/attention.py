@@ -12,7 +12,8 @@ from diffusers.modeling_utils import ModelMixin
 from diffusers.utils import BaseOutput
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.models.attention import CrossAttention, FeedForward, AdaLayerNorm
-
+# from diffusers.models.attention_processor import Attention
+from .eff_attn import EfficientAttention
 from einops import rearrange, repeat
 import pdb
 
@@ -92,7 +93,8 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
         else:
             self.proj_out = nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, return_dict: bool = True):
+    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, return_dict: bool = True, 
+                mask_dict=None, attn_bias_dict=None):
         # Input
         assert hidden_states.dim() == 5, f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
         video_length = hidden_states.shape[2]
@@ -103,7 +105,7 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
         residual = hidden_states
 
         hidden_states = self.norm(hidden_states)
-        if not self.use_linear_projection:
+        if not self.use_linear_projection: # this branch
             hidden_states = self.proj_in(hidden_states)
             inner_dim = hidden_states.shape[1]
             hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * weight, inner_dim)
@@ -118,7 +120,9 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
                 hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 timestep=timestep,
-                video_length=video_length
+                video_length=video_length,
+                mask_dict=mask_dict,
+                attn_bias_dict=attn_bias_dict,
             )
 
         # Output
@@ -178,7 +182,7 @@ class BasicTransformerBlock(nn.Module):
                 upcast_attention=upcast_attention,
             )
         else:
-            self.attn1 = CrossAttention(
+            self.attn1 = EfficientAttention(
                 query_dim=dim,
                 heads=num_attention_heads,
                 dim_head=attention_head_dim,
@@ -186,11 +190,19 @@ class BasicTransformerBlock(nn.Module):
                 bias=attention_bias,
                 upcast_attention=upcast_attention,
             )
+            # self.attn1 = CrossAttention(
+            #     query_dim=dim,
+            #     heads=num_attention_heads,
+            #     dim_head=attention_head_dim,
+            #     dropout=dropout,
+            #     bias=attention_bias,
+            #     upcast_attention=upcast_attention,
+            # )
         self.norm1 = AdaLayerNorm(dim, num_embeds_ada_norm) if self.use_ada_layer_norm else nn.LayerNorm(dim)
 
         # Cross-Attn
         if cross_attention_dim is not None:
-            self.attn2 = CrossAttention(
+            self.attn2 = EfficientAttention(
                 query_dim=dim,
                 cross_attention_dim=cross_attention_dim,
                 heads=num_attention_heads,
@@ -199,6 +211,15 @@ class BasicTransformerBlock(nn.Module):
                 bias=attention_bias,
                 upcast_attention=upcast_attention,
             )
+            # self.attn2 = CrossAttention(
+            #     query_dim=dim,
+            #     cross_attention_dim=cross_attention_dim,
+            #     heads=num_attention_heads,
+            #     dim_head=attention_head_dim,
+            #     dropout=dropout,
+            #     bias=attention_bias,
+            #     upcast_attention=upcast_attention,
+            # )
         else:
             self.attn2 = None
 
@@ -214,7 +235,7 @@ class BasicTransformerBlock(nn.Module):
         # Temp-Attn
         assert unet_use_temporal_attention is not None
         if unet_use_temporal_attention:
-            self.attn_temp = CrossAttention(
+            self.attn_temp = EfficientAttention(
                 query_dim=dim,
                 heads=num_attention_heads,
                 dim_head=attention_head_dim,
@@ -222,6 +243,14 @@ class BasicTransformerBlock(nn.Module):
                 bias=attention_bias,
                 upcast_attention=upcast_attention,
             )
+            # self.attn_temp = CrossAttention(
+            #     query_dim=dim,
+            #     heads=num_attention_heads,
+            #     dim_head=attention_head_dim,
+            #     dropout=dropout,
+            #     bias=attention_bias,
+            #     upcast_attention=upcast_attention,
+            # )
             nn.init.zeros_(self.attn_temp.to_out[0].weight.data)
             self.norm_temp = AdaLayerNorm(dim, num_embeds_ada_norm) if self.use_ada_layer_norm else nn.LayerNorm(dim)
 
@@ -253,39 +282,73 @@ class BasicTransformerBlock(nn.Module):
                 self.attn2._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
             # self.attn_temp._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
 
-    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, attention_mask=None, video_length=None):
-        # SparseCausal-Attention
-        norm_hidden_states = (
-            self.norm1(hidden_states, timestep) if self.use_ada_layer_norm else self.norm1(hidden_states)
-        )
+    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, attention_mask=None, video_length=None, 
+                mask_dict=None, attn_bias_dict=None):
+        
+        if mask_dict is not None:
+            indices1 = mask_dict["spatial"]['indices1']
+            indices2 = indices1.squeeze()
+            actual_indices = mask_dict["spatial"]['actual_indices']
+            norm_x = self.norm1(hidden_states, timestep) if self.use_ada_layer_norm else self.norm1(hidden_states)
+            if self.unet_use_cross_frame_attention:
+                cat_x1 = self.attn1(norm_x, mask_dict=mask_dict, attn_bias_dict=attn_bias_dict, mode='spatial', 
+                                    video_length=video_length, use_bias=True)
+            else:
+                cat_x1 = self.attn1(norm_x, mask_dict=mask_dict, attn_bias_dict=attn_bias_dict, mode='spatial',
+                                     use_bias=True)
+            # cat_x1 = self.attn1(self.norm1(hidden_states), mask_dict=mask_dict, attn_bias_dict=attn_bias_dict, mode='spatial', use_bias=True)
+            x1 = self.token_reuse(hidden_states, cat_x1, indices2, actual_indices, 'spatial') + hidden_states
+            
+            norm_x1 = self.norm2(x1, timestep) if self.use_ada_layer_norm else self.norm2(x1)
+            if self.attn2 is not None:
+                x2 = self.attn2(norm_x1, encoder_hidden_states=encoder_hidden_states, mask_dict=mask_dict, attn_bias_dict=attn_bias_dict) + x1
+                cat_x2 = x2.reshape(-1, x2.shape[-1])
+                cat_x2= torch.index_select(cat_x2, 0, indices1.squeeze())
+                # x2 = self.token_reuse(x1, cat_x2, indices2, actual_indices, 'spatial') + x1
+                cat_x3 = self.ff(self.norm3(cat_x2)) 
+                x3 = self.token_reuse(x1, cat_x3, indices2, actual_indices, 'spatial') + x2
+            else:
+                print('????????')
+                cat_x3 = self.ff(self.norm3(cat_x1)) 
+                x3 = self.token_reuse(x1, cat_x3, indices2, actual_indices, 'spatial') + x1
+            
+            hidden_states = x3
+        else: 
+            print("No mask_dict")
+            
+        # # SparseCausal-Attention
+        # norm_hidden_states = (
+        #     self.norm1(hidden_states, timestep) if self.use_ada_layer_norm else self.norm1(hidden_states)
+        # )
 
-        # if self.only_cross_attention:
-        #     hidden_states = (
-        #         self.attn1(norm_hidden_states, encoder_hidden_states, attention_mask=attention_mask) + hidden_states
-        #     )
+        # # if self.only_cross_attention:
+        # #     hidden_states = (
+        # #         self.attn1(norm_hidden_states, encoder_hidden_states, attention_mask=attention_mask) + hidden_states
+        # #     )
+        # # else:
+        # #     hidden_states = self.attn1(norm_hidden_states, attention_mask=attention_mask, video_length=video_length) + hidden_states
+
+        # # pdb.set_trace()
+        # if self.unet_use_cross_frame_attention:
+        #     hidden_states = self.attn1(norm_hidden_states, attention_mask=attention_mask, mask_dict=mask_dict, attn_bias_dict=attn_bias_dict,
+        #                                video_length=video_length) + hidden_states
         # else:
-        #     hidden_states = self.attn1(norm_hidden_states, attention_mask=attention_mask, video_length=video_length) + hidden_states
+        #     hidden_states = self.attn1(norm_hidden_states, attention_mask=attention_mask, mask_dict=mask_dict, attn_bias_dict=attn_bias_dict) + hidden_states
 
-        # pdb.set_trace()
-        if self.unet_use_cross_frame_attention:
-            hidden_states = self.attn1(norm_hidden_states, attention_mask=attention_mask, video_length=video_length) + hidden_states
-        else:
-            hidden_states = self.attn1(norm_hidden_states, attention_mask=attention_mask) + hidden_states
+        # if self.attn2 is not None:
+        #     # Cross-Attention
+        #     norm_hidden_states = (
+        #         self.norm2(hidden_states, timestep) if self.use_ada_layer_norm else self.norm2(hidden_states)
+        #     )
+        #     hidden_states = (
+        #         self.attn2(
+        #             norm_hidden_states, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask, mask_dict=mask_dict, attn_bias_dict=attn_bias_dict
+        #         )
+        #         + hidden_states
+        #     )
 
-        if self.attn2 is not None:
-            # Cross-Attention
-            norm_hidden_states = (
-                self.norm2(hidden_states, timestep) if self.use_ada_layer_norm else self.norm2(hidden_states)
-            )
-            hidden_states = (
-                self.attn2(
-                    norm_hidden_states, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask
-                )
-                + hidden_states
-            )
-
-        # Feed-forward
-        hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
+        # # Feed-forward
+        # hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
 
         # Temporal-Attention
         if self.unet_use_temporal_attention:
@@ -294,7 +357,20 @@ class BasicTransformerBlock(nn.Module):
             norm_hidden_states = (
                 self.norm_temp(hidden_states, timestep) if self.use_ada_layer_norm else self.norm_temp(hidden_states)
             )
-            hidden_states = self.attn_temp(norm_hidden_states) + hidden_states
+            hidden_states = self.attn_temp(norm_hidden_states, mask_dict=mask_dict, attn_bias_dict=attn_bias_dict) + hidden_states
             hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
 
         return hidden_states
+    
+    def token_reuse(self, x_in, x_out, indices, actual_indices, mode):
+        out = torch.zeros_like(x_in)
+        out = out.reshape(-1, out.shape[-1])
+        out.index_put_((indices,), x_out.squeeze())
+        out = out.reshape(x_in.shape[0], x_in.shape[1], -1) 
+        actual_indices = actual_indices.unsqueeze(-1).expand(-1, -1, out.shape[-1])
+        if mode == 'spatial':
+            out = out.permute(1, 0, 2)
+            out = out.gather(1, actual_indices).permute(1, 0, 2)
+        else:
+            out = out.gather(1, actual_indices)
+        return out
