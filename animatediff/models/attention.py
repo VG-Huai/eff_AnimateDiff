@@ -314,41 +314,41 @@ class BasicTransformerBlock(nn.Module):
             
             hidden_states = x3
         else: 
-            print("No mask_dict")
-            
-        # # SparseCausal-Attention
-        # norm_hidden_states = (
-        #     self.norm1(hidden_states, timestep) if self.use_ada_layer_norm else self.norm1(hidden_states)
-        # )
+            # print("No mask_dict")
+            # org mode
+            # SparseCausal-Attention
+            norm_hidden_states = (
+                self.norm1(hidden_states, timestep) if self.use_ada_layer_norm else self.norm1(hidden_states)
+            )
 
-        # # if self.only_cross_attention:
-        # #     hidden_states = (
-        # #         self.attn1(norm_hidden_states, encoder_hidden_states, attention_mask=attention_mask) + hidden_states
-        # #     )
-        # # else:
-        # #     hidden_states = self.attn1(norm_hidden_states, attention_mask=attention_mask, video_length=video_length) + hidden_states
+            # if self.only_cross_attention:
+            #     hidden_states = (
+            #         self.attn1(norm_hidden_states, encoder_hidden_states, attention_mask=attention_mask) + hidden_states
+            #     )
+            # else:
+            #     hidden_states = self.attn1(norm_hidden_states, attention_mask=attention_mask, video_length=video_length) + hidden_states
 
-        # # pdb.set_trace()
-        # if self.unet_use_cross_frame_attention:
-        #     hidden_states = self.attn1(norm_hidden_states, attention_mask=attention_mask, mask_dict=mask_dict, attn_bias_dict=attn_bias_dict,
-        #                                video_length=video_length) + hidden_states
-        # else:
-        #     hidden_states = self.attn1(norm_hidden_states, attention_mask=attention_mask, mask_dict=mask_dict, attn_bias_dict=attn_bias_dict) + hidden_states
+            # pdb.set_trace()
+            if self.unet_use_cross_frame_attention:
+                hidden_states = self.attn1(norm_hidden_states, attention_mask=attention_mask, mask_dict=mask_dict, attn_bias_dict=attn_bias_dict,
+                                        video_length=video_length) + hidden_states
+            else:
+                hidden_states = self.attn1(norm_hidden_states, attention_mask=attention_mask, mask_dict=mask_dict, attn_bias_dict=attn_bias_dict) + hidden_states
 
-        # if self.attn2 is not None:
-        #     # Cross-Attention
-        #     norm_hidden_states = (
-        #         self.norm2(hidden_states, timestep) if self.use_ada_layer_norm else self.norm2(hidden_states)
-        #     )
-        #     hidden_states = (
-        #         self.attn2(
-        #             norm_hidden_states, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask, mask_dict=mask_dict, attn_bias_dict=attn_bias_dict
-        #         )
-        #         + hidden_states
-        #     )
+            if self.attn2 is not None:
+                # Cross-Attention
+                norm_hidden_states = (
+                    self.norm2(hidden_states, timestep) if self.use_ada_layer_norm else self.norm2(hidden_states)
+                )
+                hidden_states = (
+                    self.attn2(
+                        norm_hidden_states, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask, mask_dict=mask_dict, attn_bias_dict=attn_bias_dict
+                    )
+                    + hidden_states
+                )
 
-        # # Feed-forward
-        # hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
+            # Feed-forward
+            hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
 
         # Temporal-Attention
         if self.unet_use_temporal_attention:

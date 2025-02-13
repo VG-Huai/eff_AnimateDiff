@@ -19,130 +19,163 @@ class EfficientAttention(CrossAttention):
         use_bias=False    
     ):
 
-        residual = hidden_states
-        heads_num = self.heads
-        
-        B, M, C = hidden_states.shape
+        if mask_dict is None:
+            batch_size, sequence_length, _ = hidden_states.shape
 
-        input_ndim = hidden_states.ndim
+            encoder_hidden_states = encoder_hidden_states
 
-        if input_ndim == 4:
-            batch_size, channel, height, width = hidden_states.shape
-            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+            if self.group_norm is not None:
+                hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
-        batch_size, key_tokens, _ = (
-            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
-        )
-        
-        # eff mode
-        if mask_dict is not None:
-            # indices = mask['indices']
-            indices1 = mask_dict[mode]['indices1']
-            indices2 = indices1.squeeze()
-            actual_indices = mask_dict[mode]['actual_indices']
-            mask = mask_dict['mask']
-        if mask is not None:
-            # time_stamp = time.time()
-            mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
-            mask = rearrange(mask, 'b 1 t h w -> (b t) (h w)') 
-        if attn_bias_dict is not None:
-            if encoder_hidden_states is not None:
-                attention_mask = attn_bias_dict[mode]['cross']
+            query = self.to_q(hidden_states)
+            dim = query.shape[-1]
+            query = self.reshape_heads_to_batch_dim(query)
+
+            if self.added_kv_proj_dim is not None:
+                key = self.to_k(hidden_states)
+                value = self.to_v(hidden_states)
+                encoder_hidden_states_key_proj = self.add_k_proj(encoder_hidden_states)
+                encoder_hidden_states_value_proj = self.add_v_proj(encoder_hidden_states)
+
+                key = self.reshape_heads_to_batch_dim(key)
+                value = self.reshape_heads_to_batch_dim(value)
+                encoder_hidden_states_key_proj = self.reshape_heads_to_batch_dim(encoder_hidden_states_key_proj)
+                encoder_hidden_states_value_proj = self.reshape_heads_to_batch_dim(encoder_hidden_states_value_proj)
+
+                key = torch.concat([encoder_hidden_states_key_proj, key], dim=1)
+                value = torch.concat([encoder_hidden_states_value_proj, value], dim=1)
             else:
-                attention_mask = attn_bias_dict[mode]['self']
+                encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+                key = self.to_k(encoder_hidden_states)
+                value = self.to_v(encoder_hidden_states)
 
-        if self.group_norm is not None:
-            hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+                key = self.reshape_heads_to_batch_dim(key)
+                value = self.reshape_heads_to_batch_dim(value)
 
-        query = self.to_q(hidden_states)
+            if attention_mask is not None:
+                if attention_mask.shape[-1] != query.shape[1]:
+                    target_length = query.shape[1]
+                    attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
+                    attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
 
-        if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
-       
-        key = self.to_k(encoder_hidden_states)
-        value = self.to_v(encoder_hidden_states)
-
-        # query = query.view(B, M, heads_num, C // heads_num)
-        # key = key.view(B, key_tokens, heads_num, C // heads_num)
-        # value = value.view(B, key_tokens, heads_num, C // heads_num)
-        
-        cat_q = query.reshape(-1, C)
-        cat_q = torch.index_select(cat_q, 0, indices1.squeeze()) 
-        cat_q = cat_q.reshape(1, -1, heads_num, C // heads_num)
-        
-        cat_k = key.reshape(1, -1, heads_num, C // heads_num)
-        cat_v = value.reshape(1, -1, heads_num, C // heads_num)
-        
-        out_with_bias = xformers.ops.memory_efficient_attention(
-            cat_q, cat_k, cat_v, attn_bias=attention_mask, scale=self.scale
-        )
-        out_with_bias = out_with_bias.reshape(1, out_with_bias.shape[1], C) # B M H K ---> B M HK
-        out_with_bias = out_with_bias.to(query.dtype)
-        
-        if use_bias:
-            out_with_bias = self.to_out[0](out_with_bias)
-            out_with_bias = self.to_out[1](out_with_bias)
-            return out_with_bias
-        
-        out = torch.zeros_like(hidden_states)
-        out = out.reshape(-1, C)
-        out.index_put_((indices2,), out_with_bias.squeeze())
-        
-        # token reuse, to be 
-        if mask is not None:
-            actual_indices1 = actual_indices.unsqueeze(-1).expand(-1, -1, out.shape[-1])
-            if mode == 'spatial':
-                # x: (B T) S C
-                out = out.reshape(mask.shape[0], mask.shape[1], -1)  # b * t, h * w, c
-                out = out.permute(1, 0, 2)
-                out = out.gather(1, actual_indices1).permute(1, 0, 2)
-
+            # attention, what we cannot get enough of
+            if self._use_memory_efficient_attention_xformers:
+                hidden_states = self._memory_efficient_attention_xformers(query, key, value, attention_mask)
+                # Some versions of xformers return output in fp32, cast it back to the dtype of the input
+                hidden_states = hidden_states.to(query.dtype)
             else:
-                # x: (B S) T C
-                out = out.reshape(B, M, C)  # b * t, h * w, c
-                out = out.gather(1, actual_indices1)
+                if self._slice_size is None or query.shape[0] // self._slice_size == 1:
+                    hidden_states = self._attention(query, key, value, attention_mask)
+                else:
+                    hidden_states = self._sliced_attention(query, key, value, sequence_length, dim, attention_mask)
 
-        hidden_states = out
-        hidden_states = hidden_states.reshape(B, M, C)
-        
-        # assert (hidden_states != self.token_reuse(hidden_states, out_with_bias, indices2, actual_indices, mode)).sum() == 0
-
-        # linear proj, for stride mismatch
-        if mode == 'spatial':
-            hidden_states = self.to_out[0](hidden_states.permute(1, 0, 2))
-            # dropout
-            hidden_states = self.to_out[1](hidden_states).permute(1, 0, 2)
-        else:
+            # linear proj
             hidden_states = self.to_out[0](hidden_states)
+
+            # dropout
             hidden_states = self.to_out[1](hidden_states)
-        # here is a demo for linear proj  mismatch
-        # out1 = out.permute(1, 0, 2)
-        # aa = attn.to_out[0](out)
-        # bb = attn.to_out[0](out1).permute(1, 0, 2)
-        # cc = attn.to_out[0](out_with_bias)
-        # cc = self.token_reuse(hidden_states, cc, indices2, actual_indices, mode)
-        # (aa != bb).sum()
-        # tensor(2094130, device='cuda:0')
-        # (aa != cc).sum()
-        # tensor(2094130, device='cuda:0')
-        # (bb != cc).sum()
-        # tensor(0, device='cuda:0')
-        # torch.allclose(aa.reshape_as(bb), bb, atol=1e-4, rtol=1e-3)
-        # True
-        # filtered_hidden_states = attn.to_out[0](out_with_bias)
-        # filtered_hidden_states = attn.to_out[1](filtered_hidden_states)
-        # filtered_hidden_states = self.token_reuse(hidden_states, filtered_hidden_states, indices2, actual_indices, mode)
+        
+        else:
+            heads_num = self.heads
+            
+            B, M, C = hidden_states.shape
 
-        if input_ndim == 4:
-            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+            input_ndim = hidden_states.ndim
 
-        # if self.residual_connection:
-        #     hidden_states = hidden_states + residual
+            if input_ndim == 4:
+                batch_size, channel, height, width = hidden_states.shape
+                hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
 
-        # hidden_states = hidden_states / self.rescale_output_factor
-        # filtered_hidden_states = filtered_hidden_states / self.rescale_output_factor
+            batch_size, key_tokens, _ = (
+                hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+            )
+            
+            # eff mode
+            if mask_dict is not None:
+                # indices = mask['indices']
+                indices1 = mask_dict[mode]['indices1']
+                indices2 = indices1.squeeze()
+                actual_indices = mask_dict[mode]['actual_indices']
+                mask = mask_dict['mask']
+            if mask is not None:
+                # time_stamp = time.time()
+                mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+                mask = rearrange(mask, 'b 1 t h w -> (b t) (h w)') 
+            if attn_bias_dict is not None:
+                if encoder_hidden_states is not None:
+                    attention_mask = attn_bias_dict[mode]['cross']
+                else:
+                    attention_mask = attn_bias_dict[mode]['self']
 
-        # return hidden_states, filtered_hidden_states
+            if self.group_norm is not None:
+                hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+            query = self.to_q(hidden_states)
+
+            if encoder_hidden_states is None:
+                encoder_hidden_states = hidden_states
+        
+            key = self.to_k(encoder_hidden_states)
+            value = self.to_v(encoder_hidden_states)
+
+            # query = query.view(B, M, heads_num, C // heads_num)
+            # key = key.view(B, key_tokens, heads_num, C // heads_num)
+            # value = value.view(B, key_tokens, heads_num, C // heads_num)
+            
+            cat_q = query.reshape(-1, C)
+            cat_q = torch.index_select(cat_q, 0, indices1.squeeze()) 
+            cat_q = cat_q.reshape(1, -1, heads_num, C // heads_num)
+            
+            cat_k = key.reshape(1, -1, heads_num, C // heads_num)
+            cat_v = value.reshape(1, -1, heads_num, C // heads_num)
+            
+            out_with_bias = xformers.ops.memory_efficient_attention(
+                cat_q, cat_k, cat_v, attn_bias=attention_mask, scale=self.scale
+            )
+            out_with_bias = out_with_bias.reshape(1, out_with_bias.shape[1], C) # B M H K ---> B M HK
+            out_with_bias = out_with_bias.to(query.dtype)
+            
+            if use_bias:
+                out_with_bias = self.to_out[0](out_with_bias)
+                out_with_bias = self.to_out[1](out_with_bias)
+                return out_with_bias
+            
+            out = torch.zeros_like(hidden_states)
+            out = out.reshape(-1, C)
+            out.index_put_((indices2,), out_with_bias.squeeze())
+            
+            # token reuse, to be 
+            if mask is not None:
+                actual_indices1 = actual_indices.unsqueeze(-1).expand(-1, -1, out.shape[-1])
+                if mode == 'spatial':
+                    # x: (B T) S C
+                    out = out.reshape(mask.shape[0], mask.shape[1], -1)  # b * t, h * w, c
+                    out = out.permute(1, 0, 2)
+                    out = out.gather(1, actual_indices1).permute(1, 0, 2)
+
+                else:
+                    # x: (B S) T C
+                    out = out.reshape(B, M, C)  # b * t, h * w, c
+                    out = out.gather(1, actual_indices1)
+
+            hidden_states = out
+            hidden_states = hidden_states.reshape(B, M, C)
+            
+            # assert (hidden_states != self.token_reuse(hidden_states, out_with_bias, indices2, actual_indices, mode)).sum() == 0
+
+            # linear proj, for stride mismatch
+            if mode == 'spatial':
+                hidden_states = self.to_out[0](hidden_states.permute(1, 0, 2))
+                # dropout
+                hidden_states = self.to_out[1](hidden_states).permute(1, 0, 2)
+            else:
+                hidden_states = self.to_out[0](hidden_states)
+                hidden_states = self.to_out[1](hidden_states)
+
+
+            if input_ndim == 4:
+                hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
         return hidden_states
     
     def token_reuse(self, x_in, x_out, indices, actual_indices, mode):

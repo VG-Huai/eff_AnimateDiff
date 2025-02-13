@@ -23,6 +23,7 @@ from diffusers.schedulers import (
     LMSDiscreteScheduler,
     PNDMScheduler,
 )
+from ..models.ddim import CustomDDIMScheduler
 from diffusers.utils import deprecate, logging, BaseOutput
 
 from einops import rearrange
@@ -49,6 +50,7 @@ class AnimationPipeline(DiffusionPipeline):
         tokenizer: CLIPTokenizer,
         unet: UNet3DConditionModel,
         scheduler: Union[
+            CustomDDIMScheduler,
             DDIMScheduler,
             PNDMScheduler,
             LMSDiscreteScheduler,
@@ -372,8 +374,9 @@ class AnimationPipeline(DiffusionPipeline):
 
         # Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
-        timesteps = make_ddim_timesteps('quad2', num_ddim_timesteps=num_inference_steps, num_ddpm_timesteps=1000)
+        # timesteps = self.scheduler.timesteps
+        # timesteps = make_ddim_timesteps('quad2', num_ddim_timesteps=num_inference_steps, num_ddpm_timesteps=1000)
+        timesteps = make_ddim_timesteps('log', num_ddim_timesteps=num_inference_steps, num_ddpm_timesteps=1000)
         timesteps = torch.tensor(timesteps, device=device)
         # timesteps = torch.tensor([
         #         998, 958, 919, 880, 842, 805, 769, 733, 699, 665, 
@@ -493,6 +496,9 @@ def make_ddim_timesteps(ddim_discr_method, num_ddim_timesteps, num_ddpm_timestep
     
     else:
         raise NotImplementedError(f'There is no ddim discretization method called "{ddim_discr_method}"')
+    
+    ddim_timesteps = interpolate_duplicates(ddim_timesteps)
+    
     print(f'Selected timesteps for ddim sampler: {ddim_timesteps}')
     # assert ddim_timesteps.shape[0] == num_ddim_timesteps
     # add one to get the final alpha values right (the ones from first scale to data during sampling)
@@ -500,3 +506,21 @@ def make_ddim_timesteps(ddim_discr_method, num_ddim_timesteps, num_ddpm_timestep
     # if verbose:
     #     print(f'Selected timesteps for ddim sampler: {steps_out}')
     return steps_out[::-1].copy()
+
+def interpolate_duplicates(arr):
+    """ 用线性插值替换数组中重复的值，保持时间步的平滑性 """
+    unique, counts = np.unique(arr, return_counts=True)
+    
+    if np.all(counts == 1):  # 没有重复项
+        return arr
+    for i in range(len(arr) - 1):
+        if arr[i] >= arr[i + 1]:
+            arr[i + 1] = arr[i] + 1
+    # 逐步调整重复值
+    # for i in range(len(arr) - 1, 0, -1):
+    #     if arr[i] == arr[i - 1]:  # 发现重复值
+    #         arr[i] = arr[i - 1] - 1  # 线性递减，确保单调性
+    #         if arr[i] < 0:
+    #             arr[i] = 0  # 防止负数
+
+    return arr

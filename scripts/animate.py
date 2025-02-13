@@ -9,7 +9,7 @@ import torchvision.transforms as transforms
 
 import diffusers
 from diffusers import AutoencoderKL, DDIMScheduler
-
+from animatediff.models.ddim import CustomDDIMScheduler
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
@@ -26,7 +26,7 @@ import csv, pdb, glob, math
 from pathlib import Path
 from PIL import Image
 import numpy as np
-
+import time
 
 @torch.no_grad()
 def main(args):
@@ -121,7 +121,8 @@ def main(args):
         pipeline = AnimationPipeline(
             vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
             controlnet=controlnet,
-            scheduler=DDIMScheduler(**OmegaConf.to_container(inference_config.noise_scheduler_kwargs)),
+            # scheduler=DDIMScheduler(**OmegaConf.to_container(inference_config.noise_scheduler_kwargs)),
+            scheduler=CustomDDIMScheduler(**OmegaConf.to_container(inference_config.noise_scheduler_kwargs)),
         ).to("cuda")
 
         pipeline = load_weights(
@@ -144,6 +145,8 @@ def main(args):
         random_seeds = model_config.get("seed", [-1])
         random_seeds = [random_seeds] if isinstance(random_seeds, int) else list(random_seeds)
         random_seeds = random_seeds * len(prompts) if len(random_seeds) == 1 else random_seeds
+        
+        start_time = time.time()
         
         config[model_idx].random_seed = []
         for prompt_idx, (prompt, n_prompt, random_seed) in enumerate(zip(prompts, n_prompts, random_seeds)):
@@ -170,10 +173,13 @@ def main(args):
             samples.append(sample)
 
             prompt = "-".join((prompt.replace("/", "").split(" ")[:10]))
-            save_videos_grid(sample, f"{savedir}/sample/{sample_idx}-{prompt}.gif")
-            print(f"save to {savedir}/sample/{prompt}.gif")
+            # save_videos_grid(sample, f"{savedir}/sample/{sample_idx}-{prompt}.gif")
+            # print(f"save to {savedir}/sample/{prompt}.gif")
             
             sample_idx += 1
+        end_time = time.time()
+        # time for each model with x prompts
+        print(f"Time for model {model_idx+1} with {sample_idx} prompts: {end_time - start_time} seconds")
 
     samples = torch.concat(samples)
     save_videos_grid(samples, f"{savedir}/sample.gif", n_rows=4)

@@ -403,7 +403,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
             cur_h, cur_w = cur_h//2, cur_w//2
             mask = self.resize_mask(mask, cur_h, cur_w)        
         
-        
+        # mask_dict = None
+        # attn_bias_dict = None
         
         # upsample size should be forwarded when sample is not a multiple of `default_overall_up_factor`
         forward_upsample_size = False
@@ -472,7 +473,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                     attn_bias_dict = attn_bias_dict,
                 )
             else:
-                sample, res_samples = downsample_block(hidden_states=sample, temb=emb, encoder_hidden_states=encoder_hidden_states)
+                sample, res_samples = downsample_block(hidden_states=sample, temb=emb, encoder_hidden_states=encoder_hidden_states, 
+                                                       mask_dict = mask_dict, attn_bias_dict = attn_bias_dict)
 
             down_block_res_samples += res_samples
 
