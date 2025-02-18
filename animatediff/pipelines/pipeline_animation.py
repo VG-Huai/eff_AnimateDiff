@@ -375,8 +375,8 @@ class AnimationPipeline(DiffusionPipeline):
         # Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         # timesteps = self.scheduler.timesteps
-        # timesteps = make_ddim_timesteps('quad2', num_ddim_timesteps=num_inference_steps, num_ddpm_timesteps=1000)
-        timesteps = make_ddim_timesteps('log', num_ddim_timesteps=num_inference_steps, num_ddpm_timesteps=1000)
+        timesteps = make_ddim_timesteps('quad2', num_ddim_timesteps=num_inference_steps, num_ddpm_timesteps=1000)
+        # timesteps = make_ddim_timesteps('log', num_ddim_timesteps=num_inference_steps, num_ddpm_timesteps=1000)
         timesteps = torch.tensor(timesteps, device=device)
         # timesteps = torch.tensor([
         #         998, 958, 919, 880, 842, 805, 769, 733, 699, 665, 

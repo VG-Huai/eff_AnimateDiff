@@ -180,12 +180,16 @@ def main(args):
         end_time = time.time()
         # time for each model with x prompts
         print(f"Time for model {model_idx+1} with {sample_idx} prompts: {end_time - start_time} seconds")
-
-    samples = torch.concat(samples)
-    save_videos_grid(samples, f"{savedir}/sample.gif", n_rows=4)
+    for idx, sample in enumerate(samples):
+        save_videos_grid(sample, f"{savedir}/sample/{idx}.gif")
+    # samples = torch.concat(samples)
+    # save_videos_grid(samples, f"{savedir}/sample.gif", n_rows=4)
 
     OmegaConf.save(config, f"{savedir}/config.yaml")
-
+    mask_percentages = pipeline.unet.mask_percentages
+    # print(f"Mask percentages: {mask_percentages}")
+    with open(os.path.join(savedir, 'mask_percentages.txt'), 'w') as f:
+        f.write(str(mask_percentages))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

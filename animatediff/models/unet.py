@@ -118,6 +118,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         self.down_blocks = nn.ModuleList([])
         self.mid_block = None
         self.up_blocks = nn.ModuleList([])
+        
+        self.mask_percentages = []
 
         if isinstance(only_cross_attention, bool):
             only_cross_attention = [only_cross_attention] * len(down_block_types)
@@ -356,6 +358,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         # filter toekn percentage
         if timestep <= 500:
             keep_idxs = self.batched_find_idxs_to_keep(sample, threshold=0.4, tubelet_size=1, patch_size=1)
+        # elif timestep > 250 and timestep <= 500:
+        #     keep_idxs = self.batched_find_idxs_to_keep(sample, threshold=0.4, tubelet_size=1, patch_size=1)
         else:
             keep_idxs = self.batched_find_idxs_to_keep(sample, threshold=0.3, tubelet_size=1, patch_size=1)
         # keep_idxs = self.batched_find_idxs_to_keep(sample, threshold=0.5, tubelet_size=1, patch_size=1)
@@ -365,6 +369,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         filtered_percentage = 100.0 * filtered_tokens / total_tokens
         print('timestep:', timestep)
         print(f"Mask Filtering: {filtered_percentage:.2f}% tokens filtered")    
+        self.mask_percentages.append(filtered_percentage)
         
         # get all the mask and attn_bias
         mask_dict = {}
