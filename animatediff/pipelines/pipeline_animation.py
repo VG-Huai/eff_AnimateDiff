@@ -412,7 +412,7 @@ class AnimationPipeline(DiffusionPipeline):
         cache_branch = 0
         interval_seq = list(range(0, num_inference_steps, cache_interval))
         interval_seq = sorted(interval_seq)
-        enable_cache = True
+        enable_cache = False
         
         # Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order

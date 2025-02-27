@@ -390,7 +390,7 @@ class CrossAttnDownBlock3D(nn.Module):
         self.gradient_checkpointing = False
 
     def forward(self, hidden_states, temb=None, encoder_hidden_states=None, attention_mask=None,
-                mask_dict=None, attn_bias_dict=None):
+                mask_dict=None, attn_bias_dict=None, exist_module_idx=None):
         output_states = ()
 
         for resnet, attn, motion_module in zip(self.resnets, self.attentions, self.motion_modules):
@@ -431,7 +431,8 @@ class CrossAttnDownBlock3D(nn.Module):
                                               ) if motion_module is not None else hidden_states
 
             output_states += (hidden_states,)
-
+            if exist_module_idx is not None and exist_module_idx == len(output_states) - 1:
+                return hidden_states, output_states
         if self.downsamplers is not None:
             for downsampler in self.downsamplers:
                 hidden_states = downsampler(hidden_states)
@@ -510,7 +511,8 @@ class DownBlock3D(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward(self, hidden_states, temb=None, encoder_hidden_states=None, mask_dict=None, attn_bias_dict=None):
+    def forward(self, hidden_states, temb=None, encoder_hidden_states=None, mask_dict=None, attn_bias_dict=None,
+                exist_module_idx=None):
         output_states = ()
 
         for resnet, motion_module in zip(self.resnets, self.motion_modules):
@@ -538,6 +540,8 @@ class DownBlock3D(nn.Module):
                                               ) if motion_module is not None else hidden_states
 
             output_states += (hidden_states,)
+            if exist_module_idx is not None and exist_module_idx == len(output_states) - 1:
+                return hidden_states, output_states
 
         if self.downsamplers is not None:
             for downsampler in self.downsamplers:
@@ -655,8 +659,13 @@ class CrossAttnUpBlock3D(nn.Module):
         attention_mask=None,
         mask_dict=None,
         attn_bias_dict=None,
+        enter_module_idx=None,
     ):
-        for resnet, attn, motion_module in zip(self.resnets, self.attentions, self.motion_modules):
+        prv_f = []
+        for idx, (resnet, attn, motion_module) in enumerate(zip(self.resnets, self.attentions, self.motion_modules)):
+            if enter_module_idx is not None and idx < enter_module_idx:
+                continue
+            prv_f.append(hidden_states)
             # pop res hidden states
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
@@ -702,7 +711,7 @@ class CrossAttnUpBlock3D(nn.Module):
             for upsampler in self.upsamplers:
                 hidden_states = upsampler(hidden_states, upsample_size)
 
-        return hidden_states
+        return hidden_states, prv_f
 
 
 class UpBlock3D(nn.Module):
@@ -771,8 +780,12 @@ class UpBlock3D(nn.Module):
         self.gradient_checkpointing = False
 
     def forward(self, hidden_states, res_hidden_states_tuple, temb=None, upsample_size=None, encoder_hidden_states=None,
-                mask_dict=None, attn_bias_dict=None):
-        for resnet, motion_module in zip(self.resnets, self.motion_modules):
+                mask_dict=None, attn_bias_dict=None, enter_module_idx=None):
+        prv_f = []
+        for idx, (resnet, motion_module) in enumerate(zip(self.resnets, self.motion_modules)):
+            if enter_module_idx is not None and idx < enter_module_idx:
+                continue
+            prv_f.append(hidden_states)
             # pop res hidden states
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
