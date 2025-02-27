@@ -375,16 +375,16 @@ class AnimationPipeline(DiffusionPipeline):
         # Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         # timesteps = self.scheduler.timesteps
-        timesteps = make_ddim_timesteps('quad2', num_ddim_timesteps=num_inference_steps, num_ddpm_timesteps=1000)
+        # timesteps = make_ddim_timesteps('quad2', num_ddim_timesteps=num_inference_steps, num_ddpm_timesteps=1000)
         # timesteps = make_ddim_timesteps('log', num_ddim_timesteps=num_inference_steps, num_ddpm_timesteps=1000)
-        timesteps = torch.tensor(timesteps, device=device)
-        # timesteps = torch.tensor([
-        #         998, 958, 919, 880, 842, 805, 769, 733, 699, 665, 
-        #         632, 600, 569, 539, 509, 480, 453, 426, 399, 374, 
-        #         349, 326, 303, 281, 260, 239, 220, 201, 183, 166, 
-        #         150, 134, 120, 106, 93, 81, 70, 59, 50, 41, 
-        #         33, 26, 20, 14, 10, 6, 3, 2, 1, 0  # 删除最后一个0避免重复
-        #     ], device="cuda:0")
+        # timesteps = torch.tensor(timesteps, device=device)
+        timesteps = torch.tensor([
+                998, 958, 919, 880, 842, 805, 769, 733, 699, 665, 
+                632, 600, 569, 539, 509, 480, 453, 426, 399, 374, 
+                349, 326, 303, 281, 260, 239, 220, 201, 183, 166, 
+                150, 134, 120, 106, 93, 81, 70, 59, 50, 41, 
+                33, 26, 20, 14, 10, 6, 3, 2, 1, 0  # 删除最后一个0避免重复
+            ], device="cuda:0")
         self.scheduler.timesteps = timesteps
 
 
@@ -408,11 +408,11 @@ class AnimationPipeline(DiffusionPipeline):
 
         # deep cache inplementation
         cache_features = None
-        cache_interval = 1
+        cache_interval = 2
         cache_branch = 0
         interval_seq = list(range(0, num_inference_steps, cache_interval))
         interval_seq = sorted(interval_seq)
-        enable_cache = False
+        enable_cache = True
         
         # Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -453,9 +453,15 @@ class AnimationPipeline(DiffusionPipeline):
                     )
 
                 if i in interval_seq:
+                    # print('11')
                     cache_features = None
                 if not enable_cache:
+                    # print('22')
                     cache_features = None
+                if cache_features is None:
+                    print(f"cache_features is None")
+                else:
+                    print(f"cache_features is not None")
                 
                 # predict the noise residual
                 noise_pred, cache_features= self.unet(
@@ -465,8 +471,9 @@ class AnimationPipeline(DiffusionPipeline):
                     cache_branch=cache_branch,
                     down_block_additional_residuals = down_block_additional_residuals,
                     mid_block_additional_residual   = mid_block_additional_residual,
-                ).sample.to(dtype=latents_dtype)
-
+                )
+                noise_pred = noise_pred.to(dtype=latents_dtype)
+                cache_features = cache_features.to(dtype=latents_dtype)
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)

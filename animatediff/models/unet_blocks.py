@@ -669,6 +669,8 @@ class CrossAttnUpBlock3D(nn.Module):
             # pop res hidden states
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+            # print('hidden_states.shape:', hidden_states.shape)
+            # print('res_hidden_states.shape:', res_hidden_states.shape)
             hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
 
             if self.training and self.gradient_checkpointing:
@@ -817,4 +819,4 @@ class UpBlock3D(nn.Module):
             for upsampler in self.upsamplers:
                 hidden_states = upsampler(hidden_states, upsample_size)
 
-        return hidden_states
+        return hidden_states, prv_f

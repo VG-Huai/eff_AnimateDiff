@@ -35,6 +35,7 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 @dataclass
 class UNet3DConditionOutput(BaseOutput):
     sample: torch.FloatTensor
+    # cache: Optional[torch.Tensor] = None
 
 
 class UNet3DConditionModel(ModelMixin, ConfigMixin):
@@ -561,7 +562,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
             # down
             down_block_res_samples = (sample,)
             # print('cache.shape' , cache_features.shape)
-            print('sample.shape', sample.shape)
+            # print('sample.shape', sample.shape)
             for downsample_block in self.down_blocks:
                 if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
                     sample, res_samples = downsample_block(
@@ -577,8 +578,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                                                         mask_dict = mask_dict, attn_bias_dict = attn_bias_dict)
 
                 down_block_res_samples += res_samples
-                print('sample.shape', sample.shape)
-                print('down_block_res_samples:', len(down_block_res_samples))
+                # print('sample.shape', sample.shape)
+                # print('down_block_res_samples:', len(down_block_res_samples))
 
             # support controlnet
             down_block_res_samples = list(down_block_res_samples)
@@ -589,12 +590,12 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                     down_block_res_samples[i] = down_block_res_samples[i] + down_block_additional_residual
 
             # mid
-            print('sample.shape', sample.shape)
+            # print('sample.shape', sample.shape)
             sample = self.mid_block(
                 sample, emb, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask,
                 mask_dict = mask_dict, attn_bias_dict = attn_bias_dict,
             )
-            print('sample.shape', sample.shape)
+            # print('sample.shape', sample.shape)
             # support controlnet
             if mid_block_additional_residual is not None:
                 if mid_block_additional_residual.dim() == 4: # boardcast
@@ -639,7 +640,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
 
         # cache mode
         return (sample, cache_features)
-        return UNet3DConditionOutput(sample=sample), cache_features
+        return UNet3DConditionOutput(sample=sample, cache=cache_features)
         
         if not return_dict:
             return (sample, cache_features)
