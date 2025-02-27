@@ -406,6 +406,14 @@ class AnimationPipeline(DiffusionPipeline):
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
+        # deep cache inplementation
+        cache_features = None
+        cache_interval = 1
+        cache_branch = 0
+        interval_seq = list(range(0, num_inference_steps, cache_interval))
+        interval_seq = sorted(interval_seq)
+        enable_cache = True
+        
         # Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -444,10 +452,17 @@ class AnimationPipeline(DiffusionPipeline):
                         guess_mode=False, return_dict=False,
                     )
 
+                if i in interval_seq:
+                    cache_features = None
+                if not enable_cache:
+                    cache_features = None
+                
                 # predict the noise residual
-                noise_pred = self.unet(
+                noise_pred, cache_features= self.unet(
                     latent_model_input, t, 
                     encoder_hidden_states=text_embeddings,
+                    cache_features=cache_features,
+                    cache_branch=cache_branch,
                     down_block_additional_residuals = down_block_additional_residuals,
                     mid_block_additional_residual   = mid_block_additional_residual,
                 ).sample.to(dtype=latents_dtype)

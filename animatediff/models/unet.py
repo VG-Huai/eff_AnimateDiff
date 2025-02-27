@@ -326,7 +326,9 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         encoder_hidden_states: torch.Tensor,
         class_labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-
+        # support deepcache
+        cache_features: Optional[torch.Tensor] = None,
+        cache_branch: Optional[int] = 0,
         # support controlnet
         down_block_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
         mid_block_additional_residual: Optional[torch.Tensor] = None,
